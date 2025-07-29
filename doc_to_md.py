@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import re
+import signal
 import sys
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse, urljoin
@@ -188,14 +189,24 @@ class DocDumper:
         self.out.mkdir(parents=True, exist_ok=True)
         self.html_dir = self.out / "html_dump"
         self.html_dir.mkdir(exist_ok=True)
+        self.progress_file = self.out / "progress.json"
 
         self.seen_urls: set[str] = set()
         self.saved_urls: set[str] = set()
         self.content_hashes: set[str] = set()
         self.url_to_file: dict[str, str] = {}
+        self.crawl_queue: list[str] = []
+        self.enqueued_urls: set[str] = set()
 
         self.dedup_enabled = dedup
         self._chunk_db: dict[str, int] = {}
+        self._shutdown_requested = False
+        
+        self._load_progress()
+        
+        self._setup_signal_handler()
+
+        self._save_progress()
 
         self.md_gen = DefaultMarkdownGenerator(
             content_source="cleaned_html",
@@ -232,6 +243,129 @@ class DocDumper:
             semaphore_count=CONCURRENCY,
         )
 
+    def _load_progress(self):
+        """Load progress from progress.json if it exists."""
+        if not self.progress_file.exists():
+            return
+        
+        try:
+            with open(self.progress_file, 'r', encoding='utf-8') as f:
+                progress = json.load(f)
+            
+            if not isinstance(progress, dict) or 'metadata' not in progress or 'state' not in progress:
+                print(f"[RESUME][WARN] Invalid progress file structure, starting fresh")
+                return
+            
+            metadata = progress.get('metadata', {})
+            if metadata.get('start_url') != self.start_url:
+                print(f"[RESUME][WARN] Progress file has different start_url, starting fresh")
+                return
+            
+            if metadata.get('host') != self.host:
+                print(f"[RESUME][WARN] Progress file has different host, starting fresh")
+                return
+            
+            state = progress.get('state', {})
+            
+            seen_urls = state.get('seen_urls', [])
+            if isinstance(seen_urls, list):
+                self.seen_urls = set(seen_urls)
+            else:
+                print(f"[RESUME][WARN] Invalid seen_urls format, ignoring")
+                
+            saved_urls = state.get('saved_urls', [])
+            if isinstance(saved_urls, list):
+                self.saved_urls = set(saved_urls)
+            else:
+                print(f"[RESUME][WARN] Invalid saved_urls format, ignoring")
+                
+            content_hashes = state.get('content_hashes', [])
+            if isinstance(content_hashes, list):
+                self.content_hashes = set(content_hashes)
+            else:
+                print(f"[RESUME][WARN] Invalid content_hashes format, ignoring")
+            
+            url_to_file = state.get('url_to_file', {})
+            if isinstance(url_to_file, dict):
+                self.url_to_file = url_to_file
+            else:
+                print(f"[RESUME][WARN] Invalid url_to_file format, ignoring")
+            
+            chunk_db = state.get('chunk_db', {})
+            if isinstance(chunk_db, dict):
+                try:
+                    self._chunk_db = {k: int(v) for k, v in chunk_db.items()}
+                except (ValueError, TypeError):
+                    print(f"[RESUME][WARN] Invalid chunk_db format, ignoring deduplication state")
+                    self._chunk_db = {}
+            else:
+                print(f"[RESUME][WARN] Invalid chunk_db format, ignoring")
+            
+            queue = state.get('queue', [])
+            if isinstance(queue, list):
+                self.crawl_queue = queue
+            else:
+                print(f"[RESUME][WARN] Invalid queue format, ignoring")
+                
+            enqueued = state.get('enqueued', [])
+            if isinstance(enqueued, list):
+                self.enqueued_urls = set(enqueued)
+            else:
+                print(f"[RESUME][WARN] Invalid enqueued format, ignoring")
+            
+            print(f"[RESUME][OK] Loaded progress: {len(self.saved_urls)} files saved, {len(self.seen_urls)} URLs seen")
+            if self.crawl_queue:
+                print(f"[RESUME][OK] Queue contains {len(self.crawl_queue)} URLs to process")
+            
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            print(f"[RESUME][ERROR] Progress file is corrupted: {e}")
+            print("[RESUME] Starting fresh...")
+        except (IOError, OSError) as e:
+            print(f"[RESUME][ERROR] Cannot read progress file: {e}")
+            print("[RESUME] Starting fresh...")
+        except Exception as e:
+            print(f"[RESUME][ERROR] Unexpected error loading progress: {e}")
+            print("[RESUME] Starting fresh...")
+
+    def _save_progress(self):
+        """Save current progress to progress.json."""
+        try:
+            progress = {
+                "metadata": {
+                    "start_url": self.start_url,
+                    "host": self.host,
+                    "dedup_enabled": self.dedup_enabled
+                },
+                "state": {
+                    "seen_urls": list(self.seen_urls),
+                    "saved_urls": list(self.saved_urls),
+                    "content_hashes": list(self.content_hashes),
+                    "url_to_file": self.url_to_file,
+                    "chunk_db": self._chunk_db,
+                    "queue": self.crawl_queue,
+                    "enqueued": list(self.enqueued_urls)
+                }
+            }
+            
+            with open(self.progress_file, 'w', encoding='utf-8') as f:
+                json.dump(progress, f, indent=2, ensure_ascii=False)
+                
+        except Exception as e:
+            print(f"[PROGRESS][ERROR] Failed to save progress: {e}")
+
+    def _setup_signal_handler(self):
+        """Set up signal handler for graceful shutdown."""
+        def signal_handler(signum, frame):
+            print(f"\n[SHUTDOWN] Received signal {signum}, saving progress...")
+            self._shutdown_requested = True
+            self._save_progress()
+            print("[SHUTDOWN] Progress saved. Exiting...")
+            sys.exit(130)
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        if hasattr(signal, 'SIGTERM'):
+            signal.signal(signal.SIGTERM, signal_handler)
+
     async def seed_urls(self) -> list[str]:
         print(f"[SEED] host={self.host} base={self.base}")
         urls: list[str] = []
@@ -246,6 +380,12 @@ class DocDumper:
         urls = [u for u in urls if in_scope(u, self.host, self.base) and not has_binary_ext(u)]
         if self.start_url not in urls:
             urls.insert(0, self.start_url)
+        
+        original_count = len(urls)
+        if self.seen_urls:
+            urls = [u for u in urls if u not in self.seen_urls]
+            print(f"[SEED] Filtered out {original_count - len(urls)} already seen URLs")
+        
         uniq, seen = [], set()
         for u in urls:
             if u not in seen:
@@ -261,13 +401,21 @@ class DocDumper:
         return url
 
     async def crawl(self):
-        if TEST_MODE:
-            print("[TEST] Test mode: crawling single URL only")
-            seeds = [self.start_url]
+        if self.crawl_queue:
+            print(f"[RESUME] Continuing with {len(self.crawl_queue)} URLs in queue")
+            queue = [url for url in self.crawl_queue if url not in self.seen_urls]
+            enq = set(self.enqueued_urls)
+            print(f"[RESUME] Filtered queue: {len(queue)} URLs remaining to process")
         else:
-            seeds = await self.seed_urls()
-            if not seeds:
+            if TEST_MODE:
+                print("[TEST] Test mode: crawling single URL only")
                 seeds = [self.start_url]
+            else:
+                seeds = await self.seed_urls()
+                if not seeds:
+                    seeds = [self.start_url]
+            queue = list(seeds)
+            enq = set(queue)
 
         dispatcher = MemoryAdaptiveDispatcher(
             memory_threshold_percent=80.0,
@@ -276,12 +424,11 @@ class DocDumper:
         )
 
         async with AsyncWebCrawler(config=self.browser_cfg) as crawler:
-            queue = list(seeds)
-            enq = set(queue)
             batch_size = 200
             hard_cap = 300_000
+            batch_count = 0
 
-            while queue and len(self.seen_urls) < hard_cap:
+            while queue and len(self.seen_urls) < hard_cap and not self._shutdown_requested:
                 batch = []
                 while queue and len(batch) < batch_size:
                     u = queue.pop(0)
@@ -300,6 +447,7 @@ class DocDumper:
                     config=cfg,
                     dispatcher=dispatcher
                 )
+                new_urls_found = False
                 async for res in results:
                     raw = normalize_url(getattr(res, "url", ""))
                     self.seen_urls.add(raw)
@@ -329,10 +477,17 @@ class DocDumper:
                             if v not in enq:
                                 enq.add(v)
                                 queue.append(v)
+                                new_urls_found = True
 
                 batch_processed = len(self.seen_urls) - batch_seen_start
                 unique_queue_size = len(set(queue))
                 print(f"[BATCH] Completed. Processed: {batch_processed}, Queue size: {unique_queue_size}, Total seen: {len(self.seen_urls)}")
+                
+                self.crawl_queue = queue
+                self.enqueued_urls = enq
+                
+                if new_urls_found or batch_processed > 0:
+                    self._save_progress()
 
     async def save_if_unique(self, url: str, res):
         if not in_scope(url, self.host, self.base) or url in self.saved_urls:
@@ -410,7 +565,11 @@ class DocDumper:
 
     async def run(self):
         print(f"[INIT] host={urlparse(self.start_url).netloc.lower()} base={self.base}")
-        await self.crawl()
+        try:
+            await self.crawl()
+        finally:
+            self._save_progress()
+            
         manifest = {
             "start_url": self.start_url,
             "host": urlparse(self.start_url).netloc.lower(),
@@ -422,6 +581,13 @@ class DocDumper:
             json.dumps(manifest, indent=2, ensure_ascii=False), "utf-8"
         )
         print(f"\nDone. Saved {len(self.url_to_file)} unique pages under {OUTPUT_DIR}")
+        
+        if self.progress_file.exists():
+            try:
+                self.progress_file.unlink()
+                print("[CLEANUP] Removed progress.json after successful completion")
+            except Exception as e:
+                print(f"[CLEANUP][WARN] Could not remove progress.json: {e}")
 
 
 if __name__ == "__main__":
