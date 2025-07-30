@@ -85,7 +85,14 @@ Only one external package is required (and assumes it’s installed):
 * [`crawl4ai`](https://pypi.org/project/crawl4ai/)
 
 ```bash
-pip install crawl4ai
+# Install the package
+pip install -U crawl4ai
+
+# Run post-installation setup
+crawl4ai-setup
+
+# Verify your installation
+crawl4ai-doctor
 ```
 
 ---
