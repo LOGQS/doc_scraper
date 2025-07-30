@@ -119,3 +119,5 @@ When the crawl finishes cleanly, `progress.json` is removed.
 * Script is tuned for docs, not general-purpose scraping.
 
 ---
+
+This project uses Crawl4AI (https://github.com/unclecode/crawl4ai) for web data extraction.
